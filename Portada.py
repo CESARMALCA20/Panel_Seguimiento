@@ -1,8 +1,13 @@
 from flask import Flask, Response, redirect, request, jsonify, make_response
-import os, sys, threading, time, hashlib, secrets
+import os, sys, socket, threading, time, hashlib, secrets
 from datetime import datetime, timedelta
 import pytz, json
 import parquet_cache
+
+# Red de seguridad: si alguna librería de red (gdown/requests) no define su
+# propio timeout, esto evita que una conexión colgada bloquee el hilo de
+# descarga para siempre.
+socket.setdefaulttimeout(160)
 
 # En Render (y en general dentro de contenedores) la salida estándar de Python
 # viene "bufferizada por bloque" cuando no hay una terminal real, así que los
@@ -101,11 +106,42 @@ def descargar_parquet(forzar=False):
         return False
 
     try:
-        print("⬇️   Descargando reporte.parquet desde Google Drive...")
         tmp = destino + ".tmp"
         if os.path.exists(tmp):
             os.remove(tmp)
-        gdown.download(id=DRIVE_FILE_ID, output=tmp, quiet=False)
+
+        # Marca "en progreso" ANTES de la llamada bloqueante. Así, si gdown
+        # se queda colgado (red lenta/inestable en Render), /api/estado-parquet
+        # deja de mostrar para siempre "aún no se ha intentado" y en cambio
+        # muestra desde cuándo está atascado — eso ya es un diagnóstico útil
+        # aunque la descarga en sí no haya terminado.
+        _DESCARGA_STATUS.update({"ok": None, "mensaje": "descarga en progreso...", "ts": time.time(), "tamano_mb": 0})
+        print("⬇️   Descargando reporte.parquet desde Google Drive...")
+
+        # Ejecuta gdown en un thread aparte con timeout: si Google Drive no
+        # responde o la conexión se cuelga, esto evita quedar bloqueado para
+        # siempre sin ningún reporte de error.
+        _resultado_dl = {}
+        def _hacer_descarga():
+            try:
+                gdown.download(id=DRIVE_FILE_ID, output=tmp, quiet=False)
+                _resultado_dl["ok"] = True
+            except Exception as e_dl:
+                _resultado_dl["ok"] = False
+                _resultado_dl["error"] = e_dl
+        t_dl = threading.Thread(target=_hacer_descarga, daemon=True)
+        t_dl.start()
+        t_dl.join(timeout=150)
+
+        if t_dl.is_alive():
+            _reportar_estado(False, "La descarga superó los 150s sin responder (Google Drive no contestó a tiempo) — se reintentará en el próximo ciclo.")
+            if os.path.exists(destino) and _es_parquet_valido(destino):
+                print("⚠️   Usando reporte.parquet existente en caché")
+                return True
+            return False
+
+        if _resultado_dl.get("ok") is False:
+            raise _resultado_dl["error"]
 
         if not os.path.exists(tmp) or not _es_parquet_valido(tmp):
             tam = os.path.getsize(tmp) / 1024 / 1024 if os.path.exists(tmp) else 0
