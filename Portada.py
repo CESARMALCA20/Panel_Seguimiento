@@ -31,10 +31,30 @@ def _cookie_secure():
 # Pon aquí el ID del archivo en Google Drive (compartido como "cualquiera con el enlace")
 DRIVE_FILE_ID = "189nuCsBwRzN1zacoNIVzf-WwQiC4iNO-"
 
+def _es_parquet_valido(path):
+    """Un parquet válido SIEMPRE termina con la firma mágica 'PAR1'.
+    Si Google Drive devolvió la página HTML de 'no se puede escanear
+    en busca de virus' en lugar del archivo real, esto lo detecta
+    antes de que rompa la app (en vez de fallar más tarde con
+    'File out of specification: The file must end with PAR1')."""
+    try:
+        if os.path.getsize(path) < 12:
+            return False
+        with open(path, "rb") as f:
+            f.seek(-4, os.SEEK_END)
+            return f.read(4) == b"PAR1"
+    except Exception:
+        return False
+
 def descargar_parquet(forzar=False):
-    """Descarga reporte.parquet desde Google Drive.
-    Si no cambió de tamaño en Drive, reutiliza el archivo local (evita descargas innecesarias)."""
-    import urllib.request, shutil
+    """Descarga reporte.parquet desde Google Drive usando gdown, que maneja
+    automáticamente la página de confirmación 'Google Drive no puede
+    escanear este archivo en busca de virus' que aparece en archivos
+    grandes (la descarga directa con urllib devolvía esa página HTML en
+    vez del parquet real, y eso causaba el error 'must end with PAR1').
+
+    Si ya existe un parquet local válido y reciente, lo reutiliza en vez
+    de volver a descargar (evita descargas innecesarias)."""
     destino = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "reporte.parquet")
     os.makedirs(os.path.dirname(destino), exist_ok=True)
 
@@ -42,35 +62,40 @@ def descargar_parquet(forzar=False):
         print("⚠️   ID de Drive no configurado — saltando descarga")
         return False
 
-    url = f"https://drive.google.com/uc?export=download&id={DRIVE_FILE_ID}&confirm=t"
-
-    remote_size = 0
-    if not forzar:
-        try:
-            req = urllib.request.Request(url, method="HEAD")
-            with urllib.request.urlopen(req, timeout=15) as r:
-                remote_size = int(r.headers.get("Content-Length", 0))
-        except Exception as e:
-            print(f"⚠️   No se pudo verificar tamaño remoto: {e}")
-
-        local_size = os.path.getsize(destino) if os.path.exists(destino) else -1
-
-        if remote_size > 0 and local_size == remote_size:
-            print(f"📦  reporte.parquet sin cambios en Drive ({local_size/1024/1024:.1f} MB)")
+    if not forzar and os.path.exists(destino) and _es_parquet_valido(destino):
+        antiguedad = time.time() - os.path.getmtime(destino)
+        if antiguedad < 1800:
+            local_size = os.path.getsize(destino)
+            print(f"📦  reporte.parquet en caché ({int(antiguedad/60)} min, {local_size/1024/1024:.1f} MB) — sin descargar de nuevo")
             return True
 
-        if remote_size == 0 and os.path.exists(destino):
-            antiguedad = time.time() - os.path.getmtime(destino)
-            if antiguedad < 1800:
-                print(f"📦  reporte.parquet en caché ({int(antiguedad/60)} min) — sin conexión para verificar Drive")
-                return True
+    try:
+        import gdown
+    except ImportError:
+        print("❌  Falta instalar 'gdown' (agrégalo a requirements.txt: pip install gdown)")
+        if os.path.exists(destino) and _es_parquet_valido(destino):
+            print("⚠️   Usando reporte.parquet existente en caché")
+            return True
+        return False
 
     try:
         print("⬇️   Descargando reporte.parquet desde Google Drive...")
         tmp = destino + ".tmp"
-        with urllib.request.urlopen(url, timeout=120) as r:
-            with open(tmp, "wb") as f:
-                shutil.copyfileobj(r, f)
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        gdown.download(id=DRIVE_FILE_ID, output=tmp, quiet=False)
+
+        if not os.path.exists(tmp) or not _es_parquet_valido(tmp):
+            print("❌  El archivo descargado NO es un parquet válido "
+                  "(probablemente Drive devolvió una página HTML — revisa que el "
+                  "archivo esté compartido como 'Cualquiera con el enlace')")
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            if os.path.exists(destino) and _es_parquet_valido(destino):
+                print("⚠️   Usando reporte.parquet existente en caché")
+                return True
+            return False
+
         os.replace(tmp, destino)
         try:
             _AVANCE_CACHE["ts"] = 0
@@ -88,7 +113,7 @@ def descargar_parquet(forzar=False):
         return True
     except Exception as e:
         print(f"❌  Error descargando: {e}")
-        if os.path.exists(destino):
+        if os.path.exists(destino) and _es_parquet_valido(destino):
             print("⚠️   Usando reporte.parquet existente en caché")
             return True
         return False
