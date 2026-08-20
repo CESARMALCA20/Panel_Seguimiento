@@ -1,8 +1,19 @@
 from flask import Flask, Response, redirect, request, jsonify, make_response
-import os, threading, time, hashlib, secrets
+import os, sys, threading, time, hashlib, secrets
 from datetime import datetime, timedelta
 import pytz, json
 import parquet_cache
+
+# En Render (y en general dentro de contenedores) la salida estándar de Python
+# viene "bufferizada por bloque" cuando no hay una terminal real, así que los
+# print() de la descarga/arranque pueden tardar minutos en aparecer en los
+# logs (o no aparecer hasta que el proceso se reinicia). Forzamos línea por
+# línea para que los logs reflejen lo que está pasando en tiempo real.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 def _import_bp(module_name, bp_name):
     """Importa un blueprint de forma segura — si el archivo no existe, avisa pero no tumba la app."""
@@ -46,6 +57,17 @@ def _es_parquet_valido(path):
     except Exception:
         return False
 
+# Guarda el resultado del ÚLTIMO intento de descarga para poder consultarlo
+# desde /api/estado-parquet sin tener que rastrear los logs de Render.
+_DESCARGA_STATUS = {"ok": None, "mensaje": "aún no se ha intentado descargar", "ts": 0, "tamano_mb": 0}
+
+def _reportar_estado(ok, mensaje, tamano_mb=0):
+    _DESCARGA_STATUS["ok"] = ok
+    _DESCARGA_STATUS["mensaje"] = mensaje
+    _DESCARGA_STATUS["ts"] = time.time()
+    _DESCARGA_STATUS["tamano_mb"] = round(tamano_mb, 2)
+    print(("✅  " if ok else "❌  ") + mensaje)
+
 def descargar_parquet(forzar=False):
     """Descarga reporte.parquet desde Google Drive usando gdown, que maneja
     automáticamente la página de confirmación 'Google Drive no puede
@@ -59,20 +81,20 @@ def descargar_parquet(forzar=False):
     os.makedirs(os.path.dirname(destino), exist_ok=True)
 
     if not DRIVE_FILE_ID or DRIVE_FILE_ID.startswith("PON_AQUI"):
-        print("⚠️   ID de Drive no configurado — saltando descarga")
+        _reportar_estado(False, "ID de Drive no configurado — saltando descarga")
         return False
 
     if not forzar and os.path.exists(destino) and _es_parquet_valido(destino):
         antiguedad = time.time() - os.path.getmtime(destino)
         if antiguedad < 1800:
-            local_size = os.path.getsize(destino)
-            print(f"📦  reporte.parquet en caché ({int(antiguedad/60)} min, {local_size/1024/1024:.1f} MB) — sin descargar de nuevo")
+            local_size = os.path.getsize(destino) / 1024 / 1024
+            _reportar_estado(True, f"reporte.parquet en caché ({int(antiguedad/60)} min) — sin descargar de nuevo", local_size)
             return True
 
     try:
         import gdown
     except ImportError:
-        print("❌  Falta instalar 'gdown' (agrégalo a requirements.txt: pip install gdown)")
+        _reportar_estado(False, "Falta instalar 'gdown' (revisa que requirements.txt esté actualizado y que Render haya reinstalado dependencias)")
         if os.path.exists(destino) and _es_parquet_valido(destino):
             print("⚠️   Usando reporte.parquet existente en caché")
             return True
@@ -86,9 +108,11 @@ def descargar_parquet(forzar=False):
         gdown.download(id=DRIVE_FILE_ID, output=tmp, quiet=False)
 
         if not os.path.exists(tmp) or not _es_parquet_valido(tmp):
-            print("❌  El archivo descargado NO es un parquet válido "
-                  "(probablemente Drive devolvió una página HTML — revisa que el "
-                  "archivo esté compartido como 'Cualquiera con el enlace')")
+            tam = os.path.getsize(tmp) / 1024 / 1024 if os.path.exists(tmp) else 0
+            _reportar_estado(False,
+                f"El archivo descargado ({tam:.2f} MB) NO es un parquet válido — "
+                f"probablemente Drive devolvió una página HTML de permiso/confirmación. "
+                f"Revisa que el archivo esté compartido como 'Cualquiera con el enlace'.")
             if os.path.exists(tmp):
                 os.remove(tmp)
             if os.path.exists(destino) and _es_parquet_valido(destino):
@@ -109,10 +133,10 @@ def descargar_parquet(forzar=False):
         except NameError:
             pass  # _AVANCE_CACHE aún no definido si se llama al importar
         size_mb = os.path.getsize(destino) / 1024 / 1024
-        print(f"✅  Descargado: {size_mb:.1f} MB")
+        _reportar_estado(True, f"Descargado correctamente: {size_mb:.1f} MB", size_mb)
         return True
     except Exception as e:
-        print(f"❌  Error descargando: {e}")
+        _reportar_estado(False, f"Error descargando: {e}")
         if os.path.exists(destino) and _es_parquet_valido(destino):
             print("⚠️   Usando reporte.parquet existente en caché")
             return True
@@ -475,6 +499,27 @@ def health():
     import parquet_cache as _pc
     datos_ok = bool(_pc._CACHE)
     return jsonify({"status": "ok", "datos": datos_ok}), 200
+
+
+@app.route("/api/estado-parquet")
+@login_required
+def api_estado_parquet():
+    """Diagnóstico rápido del parquet sin tener que leer los logs de Render:
+    visita esta URL logueado para ver si la descarga funcionó, cuándo, qué
+    tamaño quedó y el último error (si lo hubo)."""
+    existe = os.path.exists(PARQUET_PATH)
+    valido = _es_parquet_valido(PARQUET_PATH) if existe else False
+    tam_mb = round(os.path.getsize(PARQUET_PATH) / 1024 / 1024, 2) if existe else 0
+    ultima = dict(_DESCARGA_STATUS)
+    if ultima.get("ts"):
+        ultima["hace"] = f"{int((time.time() - ultima['ts']) / 60)} min"
+    return jsonify({
+        "drive_file_id": DRIVE_FILE_ID,
+        "archivo_existe": existe,
+        "archivo_valido_par1": valido,
+        "tamano_actual_mb": tam_mb,
+        "ultimo_intento_descarga": ultima,
+    })
 
 
 # ── CACHÉ Y CÁLCULO DE AVANCE DE METAS (solo los 2 módulos de este proyecto) ─
