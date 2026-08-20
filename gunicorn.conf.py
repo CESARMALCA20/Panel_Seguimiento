@@ -27,5 +27,12 @@ accesslog = "-"
 errorlog  = "-"
 loglevel  = "info"
 
-# Preload: importa la app 1 sola vez antes de crear workers
-preload_app = True
+# preload_app DESACTIVADO a propósito: con preload_app=True el hilo en
+# segundo plano que descarga el parquet (lanzado al importar Portada.py)
+# arranca en el proceso maestro ANTES del fork, y ese hilo NO sobrevive
+# al fork — el worker que atiende peticiones nunca llega a correrlo
+# (por eso /api/estado-parquet mostraba "aún no se ha intentado
+# descargar"). Con 1 solo worker, preload_app tampoco ahorra memoria real
+# (no hay múltiples workers compartiendo páginas), así que desactivarlo
+# no tiene contras aquí.
+preload_app = False
