@@ -1,0 +1,5 @@
+data/
+__pycache__/
+*.pyc
+.sessions.json
+avance_cache.json

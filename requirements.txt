@@ -1,0 +1,6 @@
+Flask>=3.0
+gunicorn>=21.2
+pytz>=2024.1
+polars>=0.20
+pandas>=2.2
+pyarrow>=15.0

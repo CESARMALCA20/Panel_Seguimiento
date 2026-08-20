@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: dashboard-salud-san-pablo
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn Portada:app
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
